@@ -3781,6 +3781,121 @@ done
 
 ***
 
+## Estimate relative R2 and var
+
+### Sparse
+
+```{bash}
+cd ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files
+dx download mind_the_gap/score_files/sparse/score_file_wgs_sparse.txt.gz
+
+cd ~/oliverpainfel/Analyses/mind_the_gap
+dx download mind_the_gap/snplist_random_subset.prop.tar
+tar -xvf snplist_random_subset.prop.tar
+
+dx download mind_the_gap/wgs/ukb_wgs_sbayesrc.test.EUR.pvar
+
+```
+
+```{r}
+
+setwd('/users/k1806347/oliverpainfel/Software/MyGit/GenoPred/pipeline')
+library(data.table)
+library(GenoUtils)
+library(foreach)
+library(doMC)
+registerDoMC(10)
+
+source('../functions/misc.R')
+source_all('../functions')
+
+# Read in score file
+score_file<-fread('~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.txt.gz')
+
+# Remove variants that are not in UKB WGS data
+ukb_snps <- fread('~/oliverpainfel/Analyses/mind_the_gap/ukb_wgs_sbayesrc.test.EUR.pvar')$ID
+score_file <- score_file[score_file$SNP %in% ukb_snps,]
+
+for(i in c(0.05, 0.25, 0.5)){
+  print(i)
+  # Read in list of randomly retained variants
+  unmasked <- fread(paste0('~/oliverpainfel/Analyses/mind_the_gap/snplist_random_subset.prop_',i,'.txt'), header = F)$V1
+  f_miss <- data.table(SNP = score_file$SNP, F_MISS = 1)
+  f_miss$F_MISS[f_miss$SNP %in% unmasked] <- 0
+  
+  # Calculate relative R2 (on each chromosome like in GenoPred)
+  rel_r2 <- rel_pgs_r2_missing_eigen(
+      ld_dir = '~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/EUR',
+      score_df = score_file,
+      f_miss = f_miss)
+      
+  write.table(
+    rel_r2, 
+    paste0(
+      '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.random.',i,'.txt'
+    ), col.names = T, row.names = F, quote = F)
+}
+
+```
+
+```{bash}
+dx upload \
+  ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.random.*.txt \
+  --path mind_the_gap/score_files/
+```
+
+***
+
+### Dense
+
+```{bash}
+cd ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_dense/reference/pgs_score_files
+dx download mind_the_gap/score_files/dense/score_file_wgs_dense.txt.gz
+```
+
+```{r}
+
+setwd('/users/k1806347/oliverpainfel/Software/MyGit/GenoPred/pipeline')
+library(data.table)
+library(GenoUtils)
+library(foreach)
+library(doMC)
+registerDoMC(10)
+
+source('../functions/misc.R')
+source_all('../functions')
+
+# Read in score file
+score_file<-fread('~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_dense/reference/pgs_score_files/score_file_wgs_dense.txt.gz')
+
+# Remove variants that are not in UKB WGS data
+ukb_snps <- fread('~/oliverpainfel/Analyses/mind_the_gap/ukb_wgs_sbayesrc.test.EUR.pvar')$ID
+score_file <- score_file[score_file$SNP %in% ukb_snps,]
+
+for(i in c(0.05, 0.25, 0.5)){
+  print(i)
+  # Read in list of randomly retained variants
+  unmasked <- fread(paste0('~/oliverpainfel/Analyses/mind_the_gap/snplist_random_subset.prop_',i,'.txt'), header = F)$V1
+  f_miss <- data.table(SNP = score_file$SNP, F_MISS = 1)
+  f_miss$F_MISS[f_miss$SNP %in% unmasked] <- 0
+  
+  # Calculate relative R2 (on each chromosome like in GenoPred)
+  rel_r2 <- rel_pgs_r2_missing_eigen(
+      ld_dir = '~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref_dense/EUR',
+      score_df = score_file,
+      f_miss = f_miss)
+      
+  write.table(
+    rel_r2, 
+    paste0(
+      '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_dense/reference/pgs_score_files/est_rsq.wgs.dense.random.',i,'.txt'
+    ), col.names = T, row.names = F, quote = F)
+}
+
+```
+
+***
+
 # Test denoising hypothesis
 
 Florian says imputation not taken into account properly. effect size is inflated by low imputation quality, and so is SE.
