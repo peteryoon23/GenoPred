@@ -3781,7 +3781,7 @@ done
 
 ***
 
-## Estimate relative R2 and var
+## Estimate relative R2 and var with random missingness
 
 ### Sparse
 
@@ -3804,7 +3804,7 @@ library(data.table)
 library(GenoUtils)
 library(foreach)
 library(doMC)
-registerDoMC(10)
+registerDoMC(20)
 
 source('../functions/misc.R')
 source_all('../functions')
@@ -3822,20 +3822,29 @@ for(i in c(0.05, 0.25, 0.5)){
   unmasked <- fread(paste0('~/oliverpainfel/Analyses/mind_the_gap/snplist_random_subset.prop_',i,'.txt'), header = F)$V1
   f_miss <- data.table(SNP = score_file$SNP, F_MISS = 1)
   f_miss$F_MISS[f_miss$SNP %in% unmasked] <- 0
+
+  rel_r2_all<-NULL
+  for(pop in c('EUR','AFR')){  
+    # Calculate relative R2 (on each chromosome like in GenoPred)
+    rel_r2 <- rel_pgs_r2_missing_eigen(
+        ld_dir = paste0('~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/', pop),
+        score_df = score_file,
+        f_miss = f_miss)
+    
+    rel_r2$population <- pop
+    
+    rel_r2_all <- rbind(rel_r2_all, rel_r2)
+  }
   
-  # Calculate relative R2 (on each chromosome like in GenoPred)
-  rel_r2 <- rel_pgs_r2_missing_eigen(
-      ld_dir = '~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/EUR',
-      score_df = score_file,
-      f_miss = f_miss)
-      
   write.table(
-    rel_r2, 
+    rel_r2_all, 
     paste0(
       '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.random.',i,'.txt'
     ), col.names = T, row.names = F, quote = F)
 }
 
+# One issue with this is that not all EUR SBayesRC variants will be present in the AFR SBayesRC LD ref. ~50k variants are missing.
+# To make it directly comparable to observed rel var and r2 in UKB, we should restrict the AFR UKB PGS to variants that are present in the AFR SBayesRC LD reference. If the observed and estimated values are quite different, we could see if this is why.
 ```
 
 ```{bash}
@@ -3891,6 +3900,364 @@ for(i in c(0.05, 0.25, 0.5)){
       '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_dense/reference/pgs_score_files/est_rsq.wgs.dense.random.',i,'.txt'
     ), col.names = T, row.names = F, quote = F)
 }
+
+```
+
+***
+
+## Evaluate LD-naive estimation of relative variance
+
+It is possible to estimate the relative variance without considering LD, but I hypothesise this would be less accurate. 
+Estimate the relative variance of sparse PGS using the LD naive approach.
+
+```{bash}
+cd ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files
+dx download mind_the_gap/score_files/sparse/score_file_wgs_sparse.txt.gz
+
+cd ~/oliverpainfel/Analyses/mind_the_gap
+dx download mind_the_gap/snplist_random_subset.prop.tar
+tar -xvf snplist_random_subset.prop.tar
+
+dx download mind_the_gap/wgs/ukb_wgs_sbayesrc.test.EUR.pvar
+
+```
+
+```{r}
+
+setwd('/users/k1806347/oliverpainfel/Software/MyGit/GenoPred/pipeline')
+library(data.table)
+library(GenoUtils)
+library(foreach)
+library(doMC)
+registerDoMC(20)
+
+source('../functions/misc.R')
+source_all('../functions')
+
+# Read in score file
+score_file<-fread('~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.txt.gz')
+
+# Remove variants that are not in UKB WGS data
+ukb_snps <- fread('~/oliverpainfel/Analyses/mind_the_gap/ukb_wgs_sbayesrc.test.EUR.pvar')$ID
+score_file <- score_file[score_file$SNP %in% ukb_snps,]
+
+for(i in c(0.05, 0.25, 0.5)){
+  print(i)
+  # Read in list of randomly retained variants
+  unmasked <- fread(paste0('~/oliverpainfel/Analyses/mind_the_gap/snplist_random_subset.prop_',i,'.txt'), header = F)$V1
+  f_miss <- data.table(SNP = score_file$SNP, F_MISS = 1)
+  f_miss$F_MISS[f_miss$SNP %in% unmasked] <- 0
+
+  rel_r2_all<-NULL
+  for(pop in c('EUR','AFR')){  
+    # Calculate relative R2 (on each chromosome like in GenoPred)
+    rel_r2 <- rel_pgs_r2_missing_af(
+        ld_dir = paste0('~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/', pop),
+        score_df = score_file,
+        f_miss = f_miss)
+
+    rel_r2$population <- pop
+    
+    rel_r2_all <- rbind(rel_r2_all, rel_r2)
+  }
+  
+  write.table(
+    rel_r2_all, 
+    paste0(
+      '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.random.',i,'.ld_naive.txt'
+    ), col.names = T, row.names = F, quote = F)
+}
+
+```
+
+```{bash}
+dx upload \
+  ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.random.*.ld_naive.txt \
+  --path mind_the_gap/score_files/
+```
+
+***
+
+## Estimate relative R2 and var across arrays and panels
+
+### Sparse
+
+```{bash}
+cd ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files
+dx download mind_the_gap/score_files/sparse/score_file_wgs_sparse.txt.gz
+```
+
+```{r}
+
+setwd('/users/k1806347/oliverpainfel/Software/MyGit/GenoPred/pipeline')
+library(data.table)
+library(GenoUtils)
+library(foreach)
+library(doMC)
+registerDoMC(20)
+
+source('../functions/misc.R')
+source_all('../functions')
+
+# Read in rsq information
+rsq<-readRDS('~/oliverpainfel/Analyses/mind_the_gap/snp_data/rsq_browser.hm3_sbayesrc.rds')
+
+# We will merge by SNP, A1 and A2 information, so delete other information
+rsq$CHR <- NULL
+rsq$BP <- NULL
+
+# Read in score file
+score_file<-fread('~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.txt.gz')
+
+# Restrict score file to variants in the rsq browser
+score_file <- score_file[score_file$SNP %in% rsq$SNP,]
+
+panels <- c( "HC_1kg", "HC_hrc", "HC_top", "OE_1kg", "OE_hrc", "OE_top", "IO_1kg", "IO_hrc", "IO_top", "MG_1kg", "MG_hrc", "MG_top")
+
+for(panel_i in panels){
+  print(panel_i)
+  
+  # Subset rsqbrowser panel
+  rsq_j <- rsq[, c('SNP', panel_i), with = F]
+  rsq_j$F_MISS <- 1 - rsq_j[[panel_i]]
+
+  rel_r2_all<-NULL
+  for(pop in 'EUR'){  
+    # Calculate relative R2 (on each chromosome like in GenoPred)
+    rel_r2 <- rel_pgs_r2_missing_eigen(
+        ld_dir = paste0('~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/', pop),
+        score_df = score_file,
+        f_miss = rsq_j)
+    
+    rel_r2$population <- pop
+    
+    rel_r2_all <- rbind(rel_r2_all, rel_r2)
+  }
+  
+  write.table(
+    rel_r2_all, 
+    paste0(
+      '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.rsq.',panel_i,'.txt'
+    ), col.names = T, row.names = F, quote = F)
+}
+
+```
+
+***
+
+### Dense
+
+```{bash}
+cd ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_dense/reference/pgs_score_files
+dx download mind_the_gap/score_files/dense/score_file_wgs_dense.txt.gz
+```
+
+```{r}
+setwd('/users/k1806347/oliverpainfel/Software/MyGit/GenoPred/pipeline')
+library(data.table)
+library(GenoUtils)
+library(foreach)
+library(doMC)
+registerDoMC(20)
+
+source('../functions/misc.R')
+source_all('../functions')
+
+# Read in rsq information
+rsq<-readRDS('~/oliverpainfel/Analyses/mind_the_gap/snp_data/rsq_browser.hm3_sbayesrc.rds')
+
+# We will merge by SNP, A1 and A2 information, so delete other information
+rsq$CHR <- NULL
+rsq$BP <- NULL
+
+# Read in score file
+score_file<-fread('~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_dense/reference/pgs_score_files/score_file_wgs_dense.txt.gz')
+
+# Restrict score file to variants in the rsq browser
+score_file <- score_file[score_file$SNP %in% rsq$SNP,]
+
+panels <- c( "HC_1kg", "HC_hrc", "HC_top", "OE_1kg", "OE_hrc", "OE_top", "IO_1kg", "IO_hrc", "IO_top", "MG_1kg", "MG_hrc", "MG_top")
+
+for(panel_i in panels){
+  print(panel_i)
+  
+  # Subset rsqbrowser panel
+  rsq_j <- rsq[, c('SNP', panel_i), with = F]
+  rsq_j$F_MISS <- 1 - rsq_j[[panel_i]]
+
+  rel_r2_all<-NULL
+  for(pop in 'EUR'){  
+    # Calculate relative R2 (on each chromosome like in GenoPred)
+    rel_r2 <- rel_pgs_r2_missing_eigen(
+        ld_dir = paste0('~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/', pop),
+        score_df = score_file,
+        f_miss = rsq_j)
+    
+    rel_r2$population <- pop
+    
+    rel_r2_all <- rbind(rel_r2_all, rel_r2)
+  }
+  
+  write.table(
+    rel_r2_all, 
+    paste0(
+      '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_dense/reference/pgs_score_files/est_rsq.wgs.dense.rsq.',panel_i,'.txt'
+    ), col.names = T, row.names = F, quote = F)
+}
+
+```
+
+***
+
+### Plot results
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(cowplot)
+
+panels <- c( "HC_1kg", "HC_hrc", "HC_top", "OE_1kg", "OE_hrc", "OE_top", "IO_1kg", "IO_hrc", "IO_top", "MG_1kg", "MG_hrc", "MG_top")
+
+rel_r2_sparse <- NULL
+for(i in panels){
+  tmp <- fread(
+    paste0(
+      '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.rsq.',i,'.txt'
+    )
+  )
+  tmp$group <- i
+  tmp$snplist <- 'sparse'
+  rel_r2_sparse <- rbind(rel_r2_sparse, tmp)
+}
+
+rel_r2_dense <- NULL
+for(i in panels){
+  tmp <- fread(
+    paste0(
+      '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_dense/reference/pgs_score_files/est_rsq.wgs.dense.rsq.',i,'.txt'
+    )
+  )
+  tmp$group <- i
+  tmp$snplist <- 'dense'
+  rel_r2_dense <- rbind(rel_r2_dense, tmp)
+}
+
+rel_r2 <- rbind(rel_r2_sparse, rel_r2_dense)
+
+rel_r2$array <- gsub('_.*','', rel_r2$group)
+rel_r2$panel <- gsub('.*_','', rel_r2$group)
+
+rel_r2$pgs_method <- gsub('_.*','',rel_r2$beta_set)
+rel_r2$trait <- sub("^[^_]*_([^_]*)_.*$", "\\1", rel_r2$beta_set)
+rel_r2$param <- sub("^[^_]*_[^_]*_(.*)$", "\\1", rel_r2$beta_set)
+rel_r2$param[rel_r2$pgs_method != 'ptclump'] <- NA
+rel_r2$param <- as.numeric(gsub('SCORE_0_','', rel_r2$param))
+
+rel_r2$param[is.na(rel_r2$param)]<-rel_r2$pgs_method[is.na(rel_r2$param)]
+rel_r2$param<-factor(rel_r2$param, levels = unique(rel_r2$param))
+
+# Recode panels
+rel_r2$panel <- factor(
+  rel_r2$panel,
+  levels = c("1kg", "hrc", "top"),
+  labels = c("1000 Genomes", "HRC", "TOPMed")
+)
+
+# Recode arrays
+rel_r2$array <- factor(
+  rel_r2$array,
+  levels = c("HC", "OE", "MG", "IO"),
+  labels = c("Core", "OmniExpress", "MEGA", "Omni 2.5M")
+)
+
+# Recode snplist
+rel_r2$snplist <- factor(
+  rel_r2$snplist,
+  levels = c('sparse','dense'),
+  labels = c('Sparse','Dense')
+)
+
+dir.create('~/oliverpainfel/Analyses/mind_the_gap/sbayesrc', showWarnings = F)
+
+# Plot portability across PGS method parameters
+p1 <- ggplot(rel_r2[rel_r2$panel == 'TOPMed' & rel_r2$population == 'EUR',], aes(x = array, y = relative_R2, fill = param)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::percent, limits = c(NA, 1)) +
+  labs(x = "Array", y = expression(Estimated~Cor(s, s*minute)^2)) +
+  theme_half_open() +
+  panel_border() +
+  background_grid() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+p2 <- ggplot(rel_r2[rel_r2$panel == 'TOPMed' & rel_r2$population == 'EUR',], aes(x = array, y = relative_variance, fill = param)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::percent, limits = c(NA, 1)) +
+  labs(x = "Array", y = expression(Estimated~Var[s*minute] / Var[s])) +
+  theme_half_open() +
+  panel_border() +
+  background_grid() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+png('~/oliverpainfel/Analyses/mind_the_gap/sbayesrc/est_rel_var_rsq_method_wgs.png', res = 300, width = 2750, height = 2500, units = 'px')
+plot_grid(p1, p2, labels = c('A', 'B'), ncol = 1)
+dev.off()
+
+# Plot portability across snplists for SBayesRC
+p1 <- ggplot(rel_r2[rel_r2$pgs_method == 'sbayesrc' & rel_r2$population == 'EUR',], aes(x = array, y = relative_R2, fill = panel)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::percent, limits = c(NA, 1)) +
+  facet_grid(. ~ snplist ) +
+  labs(x = "Array", y = expression(Estimated~Cor(s, s*minute)^2)) +
+  theme_half_open() +
+  panel_border() +
+  background_grid() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+p2 <- ggplot(rel_r2[rel_r2$pgs_method == 'sbayesrc' & rel_r2$population == 'EUR',], aes(x = array, y = relative_variance, fill = panel)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::percent, limits = c(NA, 1)) +
+  facet_grid(. ~ snplist ) +
+  labs(x = "Array", y = expression(Estimated~Var[s*minute] / Var[s])) +
+  theme_half_open() +
+  panel_border() +
+  background_grid() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+png('~/oliverpainfel/Analyses/mind_the_gap/sbayesrc/est_rel_var_rsq_snplist_wgs.png', res = 300, width = 2750, height = 2500, units = 'px')
+plot_grid(p1, p2, labels = c('A', 'B'), ncol = 1)
+dev.off()
+
+png('~/oliverpainfel/Analyses/mind_the_gap/sbayesrc/rsq_metrics_eigen_wgs.png',
+    units = 'px',
+    width = 3000,
+    height = 1750,
+    res = 300)
+
+ggplot(rel_r2, aes(x = array, y = relative_R2, fill = panel)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Array", y = "Relative R2", title = "Distribution by metric, array, and panel") +
+  facet_grid(. ~ snplist + pgs_method ) +
+  theme_half_open() +
+  panel_border() +
+  background_grid()
+dev.off()
+
+png('~/oliverpainfel/Analyses/mind_the_gap/sbayesrc/var_metrics_eigen_wgs.png',
+    units = 'px',
+    width = 3000,
+    height = 1750,
+    res = 300)
+
+ggplot(rel_r2, aes(x = array, y = relative_variance, fill = panel)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Array", y = "Relative Variance", title = "Distribution by metric, array, and panel") +
+  facet_grid(. ~ snplist) +
+  theme_half_open() +
+  panel_border() +
+  background_grid()
+dev.off()
 
 ```
 
@@ -5137,6 +5504,347 @@ denoising_plot_v6 <- ggplot(results, aes(x = est_rel_r2, y = obs_rel_r2)) +
 print(denoising_plot_v6)
 
 ```
+
+***
+
+# PGS-impute
+
+Jian Zeng and colleauges have developed PGS-impute, which adapts SNP-bayesRC weights to account for the variants present in a given target sample. It is tailored for SBayesRC output (as far as I can tell).
+
+We should evaluate their approach, and test whether it can be applied to other PGS methods effectively. It may be more efficient to implement their approach in my R function for estimating relative variance and R2, to avoid reading in the LD reference data repeatedly.
+
+Lets evaluate PGS-impute using the SBayesRC and pT+clump scores from GWAS of 10 traits in EUR UKB WGS data. We can remove variants with an INFO < 0.95 based on worst array and imputation panel, and then evaluate the score with and without adjustment using PGS-Impute.
+
+Use the snplist where proportions of variants based on RSQ are removed.
+
+```{bash}
+cd ~/oliverpainfel/Analyses/mind_the_gap/snp_data/
+dx download mind_the_gap/snplist_rsq_subset.prop.tar
+tar -xf snplist_rsq_subset.prop.tar
+```
+
+```{r}
+# Flip effects in score file to match A1 reference
+map_score<-function(ref, score){
+  # Check if required columns exist
+  required_cols <- c('SNP', 'A1', 'A2')
+  if (!all(required_cols %in% names(ref)) | 
+      !all(required_cols %in% names(score))) {
+    stop('ref and score must contain SNP, A1, and A2 columns.')
+  }
+  
+  # Valid alleles
+  valid_alleles <- c('A', 'T', 'C', 'G')
+  
+  # Check for NA or invalid alleles in A1 and A2 columns
+  for (col in c('A1', 'A2')) {
+    if (any(is.na(ref[[col]])) | any(!ref[[col]] %in% valid_alleles)) {
+      stop(paste('Invalid allele values detected in ref column:', col))
+    }
+    if (any(is.na(score[[col]])) | any(!score[[col]] %in% valid_alleles)) {
+      stop(paste('Invalid allele values detected in score column:', col))
+    }
+  }
+  
+  # Check for NA values in SNP column
+  if (any(is.na(ref$SNP)) | any(is.na(score$SNP))) {
+    stop('NA values detected in SNP column of ref or score.')
+  }
+  
+  ref <- ref[, c('SNP','A1','A2'), with = F]
+  tmp <- merge(ref, score, by = 'SNP', all.x=T, sort = F)
+  flip <- which(tmp$A1.x != tmp$A1.y)
+  tmp <- as.matrix(tmp[, -1:-5, drop = FALSE])
+  tmp[flip, ] <- -tmp[flip, ,drop=F]
+  new_score<-cbind(ref, tmp)
+  new_score[is.na(new_score)]<-0
+
+  return(new_score)
+}
+
+# Format the score files for GCTB convert function
+library(data.table)
+
+ref <- fread('~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/EUR/snp.info')
+ref <- ref[, c('ID','A1','A2','A1Freq'), with = F]
+names(ref)<-c('SNP','A1','A2','A1Freq')
+
+score_all<-fread('/users/k1806347/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.txt.gz')
+score_all <- score_all[, c('SNP','A1','A2', names(score_all)[grepl('SBayesRC', names(score_all))]), with =F]
+score_all <- map_score(ref = ref, score = score_all)
+
+for(trait in c('HT','HB','PLT','BMI','BWT','MCHC','SBP','NEU','HDL','TC')){
+  score_file <- score_all[, c('SNP','A1','A2', paste0('sbayesrc_', trait,'_SCORE_SBayesRC')), with = F]
+  names(score_file)<-c('SNP', 'A1', 'A2', 'BETA')
+  score_file$A1Frq <- ref$A1Freq
+  score_file$PIP <- 1
+  score_file<-score_file[score_file$BETA != 0,]
+  fwrite(score_file, paste0('/users/k1806347/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/sbayesrc/', trait, '/ref-', trait, '.gctb.score'), quote = F, sep = '\t')
+}
+```
+
+```{bash}
+
+for prop in 0.5 0.25 0.05; do
+  for trait in HT HB PLT BMI BWT MCHC SBP NEU HDL TC; do
+    gctb=/users/k1806347/oliverpainfel/Software/gctb_2.5.4_Linux/gctb
+    predictor=/users/k1806347/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/sbayesrc/${trait}/ref-${trait}.gctb.score
+    ldm=/users/k1806347/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/EUR
+    targetlist=$(ls /users/k1806347/oliverpainfel/Analyses/mind_the_gap/snp_data/snplist_rsq_subset.prop_${prop}.*.EUR.txt)
+    output=/users/k1806347/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/sbayesrc/${trait}/ref-${trait}.gctb.convert.rsq_${prop}.score
+    
+    sbatch --mem 10G -n 4 -p neurohack_cpu -t 1:00:00 --wrap="
+      $gctb --convert  \
+        --snp-res $predictor  \
+        --ldm-eigen  $ldm \
+        --extract $targetlist  \
+        --thread 4 \
+        --out $output"
+  
+  done
+done
+
+```
+
+```{r}
+# Flip effects in score file to match A1 reference
+map_score<-function(ref, score){
+  # Check if required columns exist
+  required_cols <- c('SNP', 'A1', 'A2')
+  if (!all(required_cols %in% names(ref)) | 
+      !all(required_cols %in% names(score))) {
+    stop('ref and score must contain SNP, A1, and A2 columns.')
+  }
+  
+  # Valid alleles
+  valid_alleles <- c('A', 'T', 'C', 'G')
+  
+  # Check for NA or invalid alleles in A1 and A2 columns
+  for (col in c('A1', 'A2')) {
+    if (any(is.na(ref[[col]])) | any(!ref[[col]] %in% valid_alleles)) {
+      stop(paste('Invalid allele values detected in ref column:', col))
+    }
+    if (any(is.na(score[[col]])) | any(!score[[col]] %in% valid_alleles)) {
+      stop(paste('Invalid allele values detected in score column:', col))
+    }
+  }
+  
+  # Check for NA values in SNP column
+  if (any(is.na(ref$SNP)) | any(is.na(score$SNP))) {
+    stop('NA values detected in SNP column of ref or score.')
+  }
+  
+  ref <- ref[, c('SNP','A1','A2'), with = F]
+  tmp <- merge(ref, score, by = 'SNP', all.x=T, sort = F)
+  flip <- which(tmp$A1.x != tmp$A1.y)
+  tmp <- as.matrix(tmp[, -1:-5, drop = FALSE])
+  tmp[flip, ] <- -tmp[flip, ,drop=F]
+  new_score<-cbind(ref, tmp)
+  new_score[is.na(new_score)]<-0
+
+  return(new_score)
+}
+
+# Combine the converted score files into a single file
+ref <- NULL
+for(i in 1:22){
+  ref <- rbind(
+    ref,
+    readRDS(
+      paste0(
+        '/users/k1806347/MyGit/GenoPred/pipeline/resources/data/ref/ref.chr', i,'.rds'
+      )
+    )
+  )
+}
+
+score_all <- NULL
+for(prop in c(0.5, 0.25, 0.05)){
+  for(trait in c('HT','HB','PLT','BMI','BWT','MCHC','SBP','NEU','HDL','TC')){
+    score_i <-fread(paste0('/users/k1806347/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/sbayesrc/', trait, '/ref-', trait, '.gctb.convert.rsq_', prop, '.score.converted.snpRes'))
+    
+    score_i <- map_score(ref = ref, score = score_i)
+    names(score_i)[4] <-paste0('sbayesrc_', trait, '_SCORE_SBayesRC_rsq_', prop)
+    score_all <- cbind(score_all, score_i[, paste0('sbayesrc_', trait, '_SCORE_SBayesRC_rsq_', prop), with = F])
+  }
+}
+
+score_all <- data.table(
+  ref[, c('SNP','A1','A2'), with = F],
+  score_all
+)
+
+fwrite(score_all, '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.convert.txt', col.names=T, sep=' ', quote=F)
+system('gzip ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.convert.txt')
+```
+
+```{bash}
+dx upload ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.convert.txt.gz --path mind_the_gap/score_files/sparse/
+```
+
+***
+
+## Estimate relative r2 and variance after imputation
+
+```{r}
+
+setwd('/users/k1806347/oliverpainfel/Software/MyGit/GenoPred/pipeline')
+library(data.table)
+library(GenoUtils)
+library(foreach)
+library(doMC)
+registerDoMC(20)
+
+source('../functions/misc.R')
+source_all('../functions')
+
+# Read in the baseline PGS
+baseline_score_all<-fread('/users/k1806347/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.txt.gz')
+
+# Read in the recovered PGS
+recovered_score_all<-fread('~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.convert.txt.gz')
+
+# Split recovered by proportion masked
+recovered_score_list <- list(
+  prop_0.5 = recovered_score_all[, c('SNP','A1','A2', names(recovered_score_all)[grepl('rsq_0.5', names(recovered_score_all))]), with = F],
+  prop_0.25 = recovered_score_all[, c('SNP','A1','A2', names(recovered_score_all)[grepl('rsq_0.25', names(recovered_score_all))]), with = F],
+  prop_0.05 = recovered_score_all[, c('SNP','A1','A2', names(recovered_score_all)[grepl('rsq_0.05', names(recovered_score_all))]), with = F]
+)
+recovered_score_list <- lapply(recovered_score_list, function(x) {
+  names(x) <- gsub('_rsq.*', '', names(x))
+  return(x)
+})
+
+# Identify common PGS
+common_pgs <- intersect(names(baseline_score_all)[-1:-3], names(recovered_score_list[[1]])[-1:-3])
+baseline_score_all <- baseline_score_all[, c('SNP','A1','A2', common_pgs), with = F]
+recovered_score_list <- lapply(recovered_score_list, function(x) {
+  x <- x[, c('SNP','A1','A2', common_pgs), with = F]
+  return(x)
+})
+
+# Read in list of variants in UKB dataset
+ukb_snps <- fread('~/oliverpainfel/Analyses/mind_the_gap/ukb_wgs_sbayesrc.test.EUR.pvar')$ID
+baseline_score_all <- baseline_score_all[baseline_score_all$SNP %in% ukb_snps,]
+recovered_score_list <- lapply(recovered_score_list, function(x) {
+  x <- x[x$SNP %in% ukb_snps,]
+  return(x)
+})
+
+rel_r2_all <- NULL
+for(prop_i in c(0.5, 0.25, 0.05)){
+  print(prop_i)
+  
+  # Calculate relative r2 and var
+  rel_r2_i <- rel_pgs_r2_baseline_imputed_eigen(
+    '~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/EUR',
+    baseline_score_all,
+    recovered_score_list[[paste0('prop_', prop_i)]])
+  
+  rel_r2_i$prop <- prop_i
+  rel_r2_all <- rbind(rel_r2_all, rel_r2_i)
+}
+
+write.table(
+  rel_r2_all, 
+  paste0(
+    '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.recovered.txt'
+  ), col.names = T, row.names = F, quote = F)
+
+```
+
+```{bash}
+dx upload ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.recovered.txt --path mind_the_gap/results/
+```
+
+***
+
+## Run R implementation
+
+```{r}
+
+setwd('/users/k1806347/oliverpainfel/Software/MyGit/GenoPred/pipeline')
+library(data.table)
+library(GenoUtils)
+library(foreach)
+library(doMC)
+registerDoMC(20)
+
+source('../functions/misc.R')
+source_all('../functions')
+
+# Read in score file and restrict to SBayesRC
+score_file<-fread('/users/k1806347/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.txt.gz')
+score_file <- score_file[, c('SNP','A1','A2', names(score_file)[grepl('SBayesRC', names(score_file))]), with =F]
+
+# Subset to UKB variants
+ukb_snps <- fread('~/oliverpainfel/Analyses/mind_the_gap/ukb_wgs_sbayesrc.test.EUR.pvar')$ID
+score_file <- score_file[score_file$SNP %in% ukb_snps,]
+
+prop<-c(0.5,0.25,0.05)
+pop<-'EUR'
+imp_scores<-list()
+rel_r2_all<-NULL
+for(prop_i in prop){
+  print(prop_i)
+  
+  # Read in list of SNPs to keep
+  snplist <- list.files(path = '/users/k1806347/oliverpainfel/Analyses/mind_the_gap/snp_data/', pattern = paste0('snplist_rsq_subset.prop_', prop_i, '.*.EUR.txt'), full.names = T)
+  extract <- fread(snplist, header = F)$V1
+  f_miss <- data.table(SNP = score_file$SNP,
+                       F_MISS = ifelse(score_file$SNP %in% extract, 0, 1))
+
+  # evaluate PGS and recover
+  rel_r2 <- eval_pgs_recovery(
+      ld_dir = paste0('~/oliverpainfel/Software/MyGit/GenoPred/pipeline/resources/data/sbayesrc_ref/', pop),
+      score_df = score_file,
+      f_miss = f_miss,
+      impute = T)
+  
+  rel_r2$metrics$prop <- prop_i
+  rel_r2_all<- rbind(rel_r2_all, rel_r2$metrics)
+  rel_r2$imp_scores <- rel_r2$imp_scores[, -1]
+  imp_scores[[paste0('prop_',prop_i)]]<-rel_r2$imp_scores
+}
+
+write.table(
+  rel_r2_all, 
+  '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.recovered.rimp.txt', 
+  col.names = T, row.names = F, quote = F)
+
+# Combine the converted score files into a single file
+ref <- NULL
+for(i in 1:22){
+  ref <- rbind(
+    ref,
+    readRDS(
+      paste0(
+        '/users/k1806347/MyGit/GenoPred/pipeline/resources/data/ref/ref.chr', i,'.rds'
+      )
+    )
+  )
+}
+
+score_all <- NULL
+for(prop_i in c(0.5, 0.25, 0.05)){
+  score_i <- imp_scores[[paste0('prop_',prop_i)]] 
+  score_i <- map_score(ref = ref, score = score_i)
+  names(score_i) <- gsub('BETA_IMP_','', names(score_i))
+  names(score_i) <- gsub('SCORE_SBayesRC',paste0('SCORE_SBayesRC_rsq_', prop_i), names(score_i))
+  score_all <- cbind(score_all, score_i[, grepl('SBayesRC', names(score_i)), with = F])
+}
+
+score_all <- data.table(
+  ref[, c('SNP','A1','A2'), with = F],
+  score_all
+)
+
+fwrite(score_all, '~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.convert.rimp.txt', col.names=T, sep=' ', quote=F)
+system('/users/k1806347/oliverpainfel/Software/pigz -f ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.convert.rimp.txt')
+system('dx upload ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/score_file_wgs_sparse.convert.rimp.txt.gz --path mind_the_gap/score_files/sparse/')
+system('dx upload ~/oliverpainfel/Analyses/mind_the_gap/GenoPred/output_sbayesrc_sparse/reference/pgs_score_files/est_rsq.wgs.sparse.recovered.rimp.txt --path mind_the_gap/results/')
+```
+
 ***
 
 # Find set of well imputed variants

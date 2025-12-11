@@ -973,8 +973,7 @@ rel_pgs_r2_missing_eigen <- function(ld_dir,
      out <- numeric(4*K)
      names(out) <- c(paste0("den_", beta_cols),
                      paste0("sig_", beta_cols),
-                     paste0("cov_", beta_cols),
-                     paste0("noise_", beta_cols))
+                     paste0("cov_", beta_cols))
      return(out)
    }
    
@@ -982,9 +981,6 @@ rel_pgs_r2_missing_eigen <- function(ld_dir,
    
    S_b    <- snp_info$S[idx_b]
    call_b <- score_df$call[idx_b]
-   
-   # This is the scaling factor to convert R-variance to C-variance.
-   S2_block_avg <- mean(S_b^2, na.rm = TRUE)
    
    # BETA matrix for this block (m_b x K)
    Bmat <- sapply(beta_cols, function(cl) score_df[[cl]][idx_b])
@@ -996,17 +992,13 @@ rel_pgs_r2_missing_eigen <- function(ld_dir,
    Ut_W  <- crossprod(eig$U, W_b)          # (k_eig x K)
    Ut_Wm <- crossprod(eig$U, Wm_b)         # (k_eig x K)
    
-   # This scales the standardized variance components (from R) to the unstandardized
-   # variance components (from C) for the block: C_variance = S^2 * R_variance
-   den_b   <- S2_block_avg * colSums((sqrt(eig$lambda) * Ut_W )^2)
-   sig_b   <- S2_block_avg * colSums((sqrt(eig$lambda) * Ut_Wm)^2)
-   cov_b   <- S2_block_avg * colSums((eig$lambda) * Ut_W * Ut_Wm)
-   noise_b <- S2_block_avg * colSums((1 - call_b) * (W_b^2))
-   
+   den_b   <- colSums((sqrt(eig$lambda) * Ut_W )^2)
+   sig_b   <- colSums((sqrt(eig$lambda) * Ut_Wm)^2)
+   cov_b   <- colSums((eig$lambda) * Ut_W * Ut_Wm)
+
    out <- c( setNames(den_b,   paste0("den_",   beta_cols)),
              setNames(sig_b,   paste0("sig_",   beta_cols)),
-             setNames(cov_b,   paste0("cov_",   beta_cols)),
-             setNames(noise_b, paste0("noise_", beta_cols)) )
+             setNames(cov_b,   paste0("cov_",   beta_cols)))
    out
   }
   
@@ -1015,8 +1007,7 @@ rel_pgs_r2_missing_eigen <- function(ld_dir,
   den_sum   <- get_vec("den")
   sig_sum   <- get_vec("sig")
   cov_sum   <- get_vec("cov")
-  noise_sum <- get_vec("noise")
-  
+
   # ---- Final metric ----
   rel_var <- ifelse(den_sum > 0, sig_sum / den_sum, NA_real_)
   rel_cor <- ifelse(den_sum > 0 & sig_sum > 0, (cov_sum^2) / (den_sum * sig_sum), NA_real_)
@@ -1025,7 +1016,7 @@ rel_pgs_r2_missing_eigen <- function(ld_dir,
     beta_set = beta_cols,
     relative_variance = rel_var,
     relative_R2 = rel_cor,
-    den = den_sum, sig = sig_sum, cov = cov_sum, noise = noise_sum,
+    den = den_sum, sig = sig_sum, cov = cov_sum,
     n_in_ref = n_in_ref
   )
 }
@@ -1036,7 +1027,7 @@ combine_rel_r2 <- function(res_list) {
   all_parts <- data.table::rbindlist(res_list, use.names = TRUE, fill = TRUE)
   
   # ensure missing components are zeros before summing
-  for (nm in c("den","sig","cov","noise","n_in_ref","n_nz")) {
+  for (nm in c("den","sig","cov","n_in_ref","n_nz")) {
     if (!nm %in% names(all_parts)) all_parts[, (nm) := 0]
     all_parts[is.na(get(nm)), (nm) := 0]
   }
@@ -1048,7 +1039,6 @@ combine_rel_r2 <- function(res_list) {
     den   = sum(den,   na.rm = TRUE),
     sig   = sum(sig,   na.rm = TRUE),
     cov   = sum(cov,   na.rm = TRUE),
-    noise = sum(noise, na.rm = TRUE),
     n_in_ref = sum(n_in_ref, na.rm = TRUE),
     n_nz     = sum(n_nz,     na.rm = TRUE),
     mean_nz_miss = {
@@ -1060,7 +1050,7 @@ combine_rel_r2 <- function(res_list) {
   agg[, relative_variance := fifelse(den > 0, sig / den, NA_real_)]
   agg[, relative_R2 := fifelse(den > 0 & sig > 0, (cov^2) / (den * sig), NA_real_)]
   
-  data.table::setcolorder(agg, c("beta_set","relative_variance","relative_R2","den","sig","cov","noise","n_in_ref","n_nz","mean_nz_miss"))
+  data.table::setcolorder(agg, c("beta_set","relative_variance","relative_R2","den","sig","cov","n_in_ref","n_nz","mean_nz_miss"))
   agg[]
 }
 
@@ -1111,3 +1101,733 @@ rel_pgs_r2_missing_af <- function(ld_dir,
   })
   rbindlist(out)
 }
+
+########### Updated function with imputation
+
+## ------------------------------------------------------------------
+## Helper: block-wise PGS-impute using eigen-LD
+## ------------------------------------------------------------------
+
+pgs_impute_block_eigen <- function(eig,
+                                   S_b,
+                                   W_b,
+                                   Ut_W,
+                                   typed_idx,
+                                   ridge = 0.1) {
+
+  U      <- eig$U
+  lambda <- eig$lambda
+  
+  m <- length(S_b)
+  K <- ncol(W_b)
+  
+  if (!length(typed_idx) || K == 0L) {
+    return(matrix(0, nrow = m, ncol = K))
+  }
+  
+  # --- 1. LHS Construction (Matrix to Invert) ---
+  # Construct LD_tt (Target vs Target)
+  U_T    <- U[typed_idx, , drop = FALSE]
+  UL_T   <- sweep(U_T, 2, sqrt(lambda), "*")
+  LD_tt  <- UL_T %*% t(UL_T)
+  
+  # Add Ridge to LHS (You were already doing this)
+  diag(LD_tt) <- diag(LD_tt) + ridge 
+  
+  chol_LD_tt <- chol(LD_tt)
+  
+  # --- 2. RHS Construction (Target vs Full Correlation) ---
+  # Calculate R_tf * Beta_full
+  tmp        <- sweep(Ut_W, 1, lambda, "*")
+  LDW_b_mat  <- U %*% tmp                    
+  LDW_T_mat  <- LDW_b_mat[typed_idx, , drop = FALSE]
+  
+  # *** THE FIX: Add Ridge to RHS ***
+  # In GCTB, the covariance between a SNP and itself is (1 + ridge).
+  # We must add (ridge * W_b) to the RHS for the typed SNPs.
+  W_b_typed <- W_b[typed_idx, , drop = FALSE]
+  LDW_T_mat <- LDW_T_mat + (ridge * W_b_typed)
+  
+  # --- 3. Solve System ---
+  X <- backsolve(chol_LD_tt,
+                 forwardsolve(t(chol_LD_tt), LDW_T_mat))
+  
+  # --- 4. Back to Beta Scale ---
+  beta_imp_T_mat <- sweep(X, 1, S_b[typed_idx], "/")
+  
+  Bimp_b <- matrix(0, nrow = m, ncol = K)
+  Bimp_b[typed_idx, ] <- beta_imp_T_mat
+  
+  Bimp_b
+}
+
+pgs_impute_block_tiled <- function(eig,
+                                   S_b,
+                                   W_b,
+                                   typed_idx,
+                                   ridge = 1.5,
+                                   window_size = 1000) {
+  
+  # eig: list(U, lambda)
+  # S_b: vector length m (standard deviations)
+  # W_b: Matrix m x K (standardized weights)
+  # typed_idx: integer vector (indices of SNPs present in target)
+  
+  m <- nrow(eig$U)
+  K <- ncol(W_b)
+  
+  # Prepare output matrix for imputed weights
+  Bimp_b <- matrix(0, nrow = m, ncol = K)
+  
+  if (!length(typed_idx) || K == 0L) return(Bimp_b)
+  
+  # 1. Reconstruct Full LD (Approx)
+  #    It is more efficient to reconstruct the whole block once 
+  #    than to re-compute U * Lam * U' for every small window.
+  #    (Assuming m is < ~5000. If m > 10k, this eats RAM).
+  
+  # U_scaled = U * sqrt(lambda)
+  U_scaled <- sweep(eig$U, 2, sqrt(pmax(eig$lambda, 0)), "*")
+  
+  # R_block = U_scaled %*% t(U_scaled)
+  # This matrix is strictly Positive Semi-Definite by construction.
+  R_block <- tcrossprod(U_scaled)
+  
+  # 2. Iterate over Windows (The "Tiling" Strategy)
+  #    Matches GCTB: "unsigned numWindow = std::ceil(block->numSnpInBlock/windowSize);"
+  
+  num_windows <- ceiling(m / window_size)
+  
+  for (w in 0:(num_windows - 1)) {
+    
+    # Define window boundaries (1-based index for R)
+    start <- (w * window_size) + 1
+    end   <- min((w + 1) * window_size, m)
+    
+    # Indices of ALL SNPs in this window
+    win_idxs <- start:end
+    
+    # Identify which TARGET SNPs fall inside this window
+    # intersect() can be slow, vector logic is faster given sorted typed_idx
+    typed_in_win <- typed_idx[typed_idx >= start & typed_idx <= end]
+    
+    # If no target SNPs in this window, we can't impute anything FOR THIS WINDOW.
+    # (The weights for missing SNPs in this window remain 0).
+    if (length(typed_in_win) == 0) next
+    
+    # --- Construct Local Matrices ---
+    
+    # Local indices relative to the full block are 'win_idxs'
+    # We need to map 'typed_in_win' to row/col indices of R_block
+    
+    # R_tt: Correlation among TARGET SNPs in this window
+    R_tt <- R_block[typed_in_win, typed_in_win, drop = FALSE]
+    
+    # Add Ridge to Diagonal
+    diag(R_tt) <- diag(R_tt) + ridge
+    
+    # R_tf: Correlation between TARGET SNPs (rows) and ALL SNPs IN WINDOW (cols)
+    # Note: GCTB restricts "Full" SNPs to the window too!
+    R_tf <- R_block[typed_in_win, win_idxs, drop = FALSE]
+    
+    # RHS Construction: R_tf * W_b[window]
+    # We only use the original weights from THIS window
+    W_win <- W_b[win_idxs, , drop = FALSE]
+    RHS   <- R_tf %*% W_win
+    
+    # Add Ridge for the Typed SNPs (GCTB Logic)
+    # We need to match the rows of RHS (which correspond to typed_in_win)
+    W_typed <- W_b[typed_in_win, , drop = FALSE]
+    RHS <- RHS + (ridge * W_typed)
+    
+    # --- Solve Local System ---
+    
+    # Since R_tt is a principal submatrix of a PSD matrix + Ridge, 
+    # it is strictly Positive Definite. Cholesky will succeed.
+    chol_R_tt <- chol(R_tt)
+    
+    X <- backsolve(chol_R_tt, 
+                   forwardsolve(t(chol_R_tt), RHS))
+    
+    # --- Save Results ---
+    
+    # Convert back to Beta scale: X / S[typed]
+    beta_res <- sweep(X, 1, S_b[typed_in_win], "/")
+    
+    # Store in the output matrix
+    Bimp_b[typed_in_win, ] <- beta_res
+  }
+  
+  return(Bimp_b)
+}
+
+####
+# PGS-imputation with continuous weight based on quality
+####
+
+pgs_impute_block_continuous_eigen <- function(eig,
+                                              S_b,       # length m_b: sqrt(2 p (1-p))
+                                              Bmat,      # m_b x K: baseline betas
+                                              q_b,       # length m_b: quality in [0,1]
+                                              q_min = 0, # min quality to be a recipient
+                                              ridge_base = 1e-4,
+                                              ridge_q = 0) {
+  # eig: list(U, lambda) from readEig()
+  # S_b: numeric, length m_b
+  # Bmat: numeric matrix (m_b x K), baseline betas per block
+  # q_b: numeric, length m_b, quality measure in [0,1]
+  # q_min: threshold for being allowed as a *recipient* of redistributed effect
+  # ridge_base: base ridge term on LD_tt diag
+  # ridge_q: additional ridge proportional to (1 - q_T) to discourage low-q recipients
+  
+  U      <- eig$U
+  lambda <- eig$lambda
+  
+  m <- length(S_b)
+  K <- ncol(Bmat)
+  if (m == 0L || K == 0L) {
+    return(list(
+      B_adj       = matrix(0, nrow = m, ncol = K),
+      B_keep      = matrix(0, nrow = m, ncol = K),
+      B_donor     = matrix(0, nrow = m, ncol = K),
+      B_donor_imp = matrix(0, nrow = m, ncol = K)
+    ))
+  }
+  
+  # 1) Split into "keep" and "donor" components
+  #    beta_keep_i = q_i * beta_i
+  #    beta_donor_i = (1-q_i) * beta_i
+  B_keep  <- sweep(Bmat, 1L, q_b,     "*")
+  B_donor <- sweep(Bmat, 1L, (1 - q_b), "*")
+  
+  # If no donor signal at all, return baseline (all kept)
+  if (all(B_donor == 0)) {
+    return(list(
+      B_adj       = B_keep,
+      B_keep      = B_keep,
+      B_donor     = B_donor,
+      B_donor_imp = matrix(0, nrow = m, ncol = K)
+    ))
+  }
+  
+  # 2) W_donor = S * beta_donor
+  W_donor <- S_b * B_donor                         # (m x K)
+  
+  # Transform donor into eigen space
+  Ut_W_donor <- crossprod(U, W_donor)              # (k x K)
+  
+  # 3) Define "recipient" SNPs: high enough quality to receive redistributed effect
+  typed_idx <- which(q_b >= q_min)
+  if (!length(typed_idx)) {
+    # No recipients -> can't redistribute; everything stays as keep
+    return(list(
+      B_adj       = B_keep,
+      B_keep      = B_keep,
+      B_donor     = B_donor,
+      B_donor_imp = matrix(0, nrow = m, ncol = K)
+    ))
+  }
+  
+  # 4) Build LD_tt over recipients, with quality-aware ridge if desired
+  U_T  <- U[typed_idx, , drop = FALSE]             # (m_T x k)
+  UL_T <- sweep(U_T, 2L, sqrt(lambda), "*")        # UL_T = U_T %*% diag(sqrt(lambda))
+  LD_tt <- UL_T %*% t(UL_T)                        # (m_T x m_T)
+  
+  # Ridge on diagonal: base + optional extra for low-q recipients
+  q_T <- q_b[typed_idx]
+  diag(LD_tt) <- diag(LD_tt) + ridge_base + ridge_q * (1 - q_T)
+  
+  chol_LD_tt <- chol(LD_tt)
+  
+  # 5) Compute LD * W_donor (on full block), then restrict to recipients
+  tmp          <- sweep(Ut_W_donor, 1L, lambda, "*") # (k x K)
+  LDW_donor    <- U %*% tmp                          # (m x K)
+  LDW_T_donor  <- LDW_donor[typed_idx, , drop = FALSE]  # (m_T x K)
+  
+  # 6) Solve LD_tt %*% X = LDW_T_donor  for all K simultaneously
+  X <- backsolve(chol_LD_tt,
+                 forwardsolve(t(chol_LD_tt), LDW_T_donor))
+  
+  # Convert back to per-allele scale: beta_imp_T = X / S_T
+  beta_imp_T <- sweep(X, 1L, S_b[typed_idx], "/")  # (m_T x K)
+  
+  # Put donor-imputed betas into full-length matrix
+  B_donor_imp <- matrix(0, nrow = m, ncol = K)
+  B_donor_imp[typed_idx, ] <- beta_imp_T
+  
+  # 7) Final adjusted betas: keep local part + redistributed donor part
+  B_adj <- B_keep + B_donor_imp
+  
+  list(
+    B_adj       = B_adj,
+    B_keep      = B_keep,
+    B_donor     = B_donor,
+    B_donor_imp = B_donor_imp
+  )
+}
+
+# ------------------------------------------------------------------
+# Main: relative variance & R2 (masked + optional imputed) + imputed betas
+# ------------------------------------------------------------------
+
+eval_pgs_recovery <- function(ld_dir,
+                                     score_df,   # cols: SNP, A1, A2, <BETA_set1>, <BETA_set2>, ...
+                                     f_miss,     # cols: SNP, F_MISS  (call = 1 - F_MISS)
+                                     chr = NULL,
+                                     impute = FALSE) {
+  # ld_dir: directory with snp.info and eigen LD blocks (readEig)
+  # score_df: score file(s) aligned roughly to LD reference (will be map_score()'d)
+  # f_miss: missingness info per SNP in target (F_MISS); if NA -> treated as missing
+  # chr: optional chromosome filter for snp.info
+  # impute: if TRUE, perform PGS-impute and estimate its performance; also return imputed weights
+  
+  require(data.table)
+  
+  ## ---- Read and prepare SNP info ----
+  snp_info <- data.table::fread(file.path(ld_dir, "snp.info"))
+  if (!is.null(chr)) {
+    snp_info <- snp_info[Chrom == chr]
+  }
+  data.table::setnames(snp_info, "ID", "SNP")
+  snp_info[, S := sqrt(2 * A1Freq * (1 - A1Freq))]
+  snp_info[, idx := .I]
+  
+  ## ---- Identify BETA columns, drop all-zero rows, align with LD order ----
+  base_cols <- c("SNP", "A1", "A2")
+  stopifnot(all(base_cols %in% names(score_df)))
+  beta_cols <- setdiff(names(score_df), base_cols)
+  if (!length(beta_cols)) stop("No BETA columns found after SNP/A1/A2.")
+  
+  score_df <- as.data.table(score_df)[, c(base_cols, beta_cols), with = FALSE]
+  
+  # Drop rows where all betas are zero
+  all_zero <- apply(score_df[, ..beta_cols], 1L, function(x) all(x == 0))
+  score_df <- score_df[!all_zero]
+  
+  # Align score_df to snp_info (alleles + order)
+  score_df <- map_score(ref = snp_info, score = score_df)
+  score_df[, idx := .I]
+  
+  K <- length(beta_cols)
+  
+  ## ---- Insert missingness information ----
+  f_miss <- as.data.table(f_miss)
+  score_df <- merge(score_df, f_miss, by = "SNP", sort = FALSE, all.x = TRUE)
+  score_df$F_MISS[is.na(score_df$F_MISS)] <- 1
+  score_df[, call := 1 - F_MISS]
+  
+  ## ---- Count non-zero-in-ref per set (for reporting) ----
+  n_in_ref <- vapply(beta_cols, function(x) {
+    sum(score_df[[x]] != 0)
+  }, integer(1))
+  
+  ## ---- Identify blocks with any non-zero BETA ----
+  nz <- apply(score_df[, beta_cols, with = FALSE], 1L, function(x) any(x != 0))
+  nz_blocks <- unique(snp_info$Block[nz])
+  
+  ## ---- Parallel loop over blocks ----
+  acc <- foreach::foreach(
+    b        = nz_blocks,
+    .packages = "data.table",
+    .export   = c("readEig", "pgs_impute_block_eigen")
+  ) %dopar% {
+    
+    print(b)
+    
+    idx_b <- which(snp_info$Block == b)
+    if (!length(idx_b)) {
+      return(list(metrics = numeric(0), imp = data.table()))
+    }
+    
+    # Quick check: any non-zero betas at all in this block?
+    any_nonzero <- FALSE
+    for (k in seq_len(K)) {
+      if (any(score_df[[beta_cols[k]]][idx_b] != 0, na.rm = TRUE)) {
+        any_nonzero <- TRUE
+        break
+      }
+    }
+    if (!any_nonzero) {
+      metrics <- c(
+        setNames(rep(0, K), paste0("den_",      beta_cols)),
+        setNames(rep(0, K), paste0("sig_",      beta_cols)),
+        setNames(rep(0, K), paste0("cov_",      beta_cols)),
+        setNames(rep(0, K), paste0("sig_imp_",  beta_cols)),
+        setNames(rep(0, K), paste0("cov_imp_",  beta_cols))
+      )
+      return(list(metrics = metrics, imp = data.table()))
+    }
+    
+    eig <- readEig(ld_dir, b)
+    
+    S_b    <- snp_info$S[idx_b]
+    call_b <- score_df$call[idx_b]
+    
+    # BETA matrix (m_b x K)
+    Bmat <- sapply(beta_cols, function(cl) score_df[[cl]][idx_b])
+    Bmat[is.na(Bmat)] <- 0
+    
+    W_b  <- S_b * Bmat
+    Wm_b <- (sqrt(call_b) * S_b) * Bmat
+    
+    Ut_W  <- crossprod(eig$U, W_b)   # (k x K)
+    Ut_Wm <- crossprod(eig$U, Wm_b)  # (k x K)
+    
+    den_b   <- colSums((sqrt(eig$lambda) * Ut_W )^2)
+    sig_b   <- colSums((sqrt(eig$lambda) * Ut_Wm)^2)
+    cov_b   <- colSums((eig$lambda) * Ut_W * Ut_Wm)
+
+    # ---- Optional: PGS-impute within block ----
+    if (impute) {
+      typed_idx <- which(call_b > 0)
+      
+      if (length(typed_idx)) {
+        Bimp_b <- pgs_impute_block_tiled(
+          eig         = eig,
+          S_b         = S_b,
+          W_b         = W_b,
+          typed_idx   = typed_idx,
+          ridge       = 1.5, # Selected based on evaluation in UKB to give well calibrated weights
+          window_size = 1000  # GCTB Default
+        )
+
+        pgs_impute_block_eigen
+        
+        Wimp_b  <- S_b * Bimp_b
+        Ut_Wimp <- crossprod(eig$U, Wimp_b)
+        
+        sig_imp_b <- colSums((sqrt(eig$lambda) * Ut_Wimp)^2)
+        cov_imp_b <- colSums((eig$lambda) * Ut_W * Ut_Wimp)
+        
+        imp <- as.data.table(Bimp_b)
+        data.table::setnames(imp, paste0("BETA_IMP_", beta_cols))
+        imp[, idx := idx_b]
+      } else {
+        sig_imp_b <- rep(0, K)
+        cov_imp_b <- rep(0, K)
+        imp       <- data.table()
+      }
+      
+    } else {
+      sig_imp_b <- rep(0, K)
+      cov_imp_b <- rep(0, K)
+      imp       <- data.table()
+    }
+    
+    metrics <- c(
+      setNames(den_b,      paste0("den_",      beta_cols)),
+      setNames(sig_b,      paste0("sig_",      beta_cols)),
+      setNames(cov_b,      paste0("cov_",      beta_cols)),
+      setNames(sig_imp_b,  paste0("sig_imp_",  beta_cols)),
+      setNames(cov_imp_b,  paste0("cov_imp_",  beta_cols))
+    )
+    
+    list(metrics = metrics, imp = imp)
+  }
+  
+  ## ---- Reduce metrics across blocks ----
+  metrics_list <- lapply(acc, `[[`, "metrics")
+  imp_list     <- lapply(acc, `[[`, "imp")
+  
+  metrics_sum <- Reduce(function(a, b) {
+    if (length(a) == 0) return(b)
+    a[names(b)] <- a[names(b)] + b
+    a
+  }, metrics_list, init = numeric(0))
+  
+  get_vec <- function(prefix) {
+    nm <- paste0(prefix, "_", beta_cols)
+    out <- metrics_sum[nm]
+    # metrics_sum could be named numeric; unname it
+    unname(out)
+  }
+  
+  den_sum     <- get_vec("den")
+  sig_sum     <- get_vec("sig")
+  cov_sum     <- get_vec("cov")
+  sig_imp_sum <- get_vec("sig_imp")
+  cov_imp_sum <- get_vec("cov_imp")
+  
+  ## ---- Final metrics ----
+  # Masked PGS
+  rel_var_masked <- ifelse(den_sum > 0, sig_sum / den_sum, NA_real_)
+  rel_R2_masked  <- ifelse(den_sum > 0 & sig_sum > 0,
+                           (cov_sum^2) / (den_sum * sig_sum),
+                           NA_real_)
+  
+  # Imputed PGS
+  if (impute) {
+    rel_var_imputed <- ifelse(den_sum > 0, sig_imp_sum / den_sum, NA_real_)
+    rel_R2_imputed  <- ifelse(den_sum > 0 & sig_imp_sum > 0,
+                              (cov_imp_sum^2) / (den_sum * sig_imp_sum),
+                              NA_real_)
+  } else {
+    rel_var_imputed <- rep(NA_real_, K)
+    rel_R2_imputed  <- rep(NA_real_, K)
+  }
+  
+  metrics_dt <- data.table(
+    beta_set                 = beta_cols,
+    relative_variance_masked = rel_var_masked,
+    relative_R2_masked       = rel_R2_masked,
+    relative_variance_imputed = rel_var_imputed,
+    relative_R2_imputed       = rel_R2_imputed,
+    den         = den_sum,
+    sig_masked  = sig_sum,
+    cov_masked  = cov_sum,
+    sig_imputed = sig_imp_sum,
+    cov_imputed = cov_imp_sum,
+    n_in_ref    = n_in_ref
+  )
+  
+  ## ---- Build imputed weights (if requested) ----
+  if (impute) {
+    imp_all <- data.table::rbindlist(imp_list, use.names = TRUE, fill = TRUE)
+    
+    full_imp <- data.table(
+      idx = snp_info$idx,
+      SNP = snp_info$SNP,
+      A1  = snp_info$A1,
+      A2  = snp_info$A2
+    )
+    
+    if (nrow(imp_all)) {
+      full_imp <- merge(full_imp, imp_all, by = "idx", all.x = TRUE, sort = FALSE)
+    }
+    
+    # Ensure columns exist & fill NA with 0
+    for (cl in paste0("BETA_IMP_", beta_cols)) {
+      if (!cl %in% names(full_imp)) full_imp[[cl]] <- 0
+      full_imp[is.na(get(cl)), (cl) := 0]
+    }
+    
+    return(list(
+      metrics    = metrics_dt,
+      imp_scores = full_imp
+    ))
+    
+  } else {
+    return(list(
+      metrics = metrics_dt
+    ))
+  }
+}
+
+
+## ------------------------------------------------------------------
+## Optional: updated combine_rel_r2 for the new metrics format
+## ------------------------------------------------------------------
+
+combine_eval_pgs_recovery <- function(res_list) {
+  # res_list: list of outputs from eval_pgs_recovery (per chr, etc.)
+  # each element: list(metrics = <data.table>, imp_scores = <data.table> or NULL)
+  
+  require(data.table)
+  
+  metrics_list <- lapply(res_list, `[[`, "metrics")
+  all_parts <- data.table::rbindlist(metrics_list, use.names = TRUE, fill = TRUE)
+  
+  # Ensure numeric columns exist
+  num_cols <- c("den", "sig_masked", "cov_masked",
+                "sig_imputed", "cov_imputed",
+                "n_in_ref", "n_nz")
+  for (nm in num_cols) {
+    if (!nm %in% names(all_parts)) all_parts[, (nm) := 0]
+    all_parts[is.na(get(nm)), (nm) := 0]
+  }
+  
+  if (!"mean_nz_miss" %in% names(all_parts)) {
+    all_parts[, mean_nz_miss := NA_real_]
+  }
+  
+  agg <- all_parts[, .(
+    den         = sum(den,         na.rm = TRUE),
+    sig_masked  = sum(sig_masked,  na.rm = TRUE),
+    cov_masked  = sum(cov_masked,  na.rm = TRUE),
+    sig_imputed = sum(sig_imputed, na.rm = TRUE),
+    cov_imputed = sum(cov_imputed, na.rm = TRUE),
+    n_in_ref    = sum(n_in_ref,    na.rm = TRUE),
+    n_nz        = sum(n_nz,        na.rm = TRUE),
+    mean_nz_miss = {
+      w <- n_nz; x <- mean_nz_miss
+      if (sum(w, na.rm = TRUE) > 0) stats::weighted.mean(x, w, na.rm = TRUE) else NA_real_
+    }
+  ), by = beta_set]
+  
+  agg[, relative_variance_masked := fifelse(den > 0, sig_masked / den, NA_real_)]
+  agg[, relative_R2_masked       := fifelse(den > 0 & sig_masked > 0,
+                                            (cov_masked^2) / (den * sig_masked),
+                                            NA_real_)]
+  agg[, relative_variance_imputed := fifelse(den > 0, sig_imputed / den, NA_real_)]
+  agg[, relative_R2_imputed       := fifelse(den > 0 & sig_imputed > 0,
+                                             (cov_imputed^2) / (den * sig_imputed),
+                                             NA_real_)]
+  
+  data.table::setcolorder(
+    agg,
+    c("beta_set",
+      "relative_variance_masked", "relative_R2_masked",
+      "relative_variance_imputed", "relative_R2_imputed",
+      "den", "sig_masked", "cov_masked",
+      "sig_imputed", "cov_imputed",
+      "n_in_ref", "n_nz", "mean_nz_miss")
+  )
+  
+  agg[]
+}
+
+# Create a function for comparing baseline and recovered PGS
+rel_pgs_r2_baseline_imputed_eigen <- function(ld_dir,
+                                              baseline_score_df,  # SNP,A1,A2,BETA_*
+                                              imputed_score_df,   # SNP,A1,A2,BETA_* (same names)
+                                              chr = NULL) {
+  require(data.table)
+  require(foreach)
+  
+  ## ---- Read LD SNP info ----
+  snp_info <- data.table::fread(file.path(ld_dir, "snp.info"))
+  if (!is.null(chr)) {
+    snp_info <- snp_info[Chrom == chr]
+  }
+  data.table::setnames(snp_info, "ID", "SNP")
+  snp_info[, S := sqrt(2 * A1Freq * (1 - A1Freq))]
+  snp_info[, idx := .I]
+  
+  ## ---- Identify BETA columns and align score files ----
+  base_cols <- c("SNP", "A1", "A2")
+  stopifnot(all(base_cols %in% names(baseline_score_df)))
+  stopifnot(all(base_cols %in% names(imputed_score_df)))
+  
+  beta_base_cols <- setdiff(names(baseline_score_df), base_cols)
+  beta_imp_cols  <- setdiff(names(imputed_score_df),  base_cols)
+  
+  # Require same BETA columns in both
+  if (!setequal(beta_base_cols, beta_imp_cols)) {
+    stop("Baseline and imputed score files must have the same BETA columns.")
+  }
+  beta_cols <- beta_base_cols
+  
+  if (!length(beta_cols)) stop("No BETA columns found after SNP/A1/A2.")
+  
+  baseline_score_df <- as.data.table(baseline_score_df)[, c(base_cols, beta_cols), with = FALSE]
+  imputed_score_df  <- as.data.table(imputed_score_df)[,  c(base_cols, beta_cols), with = FALSE]
+  
+  # Align both to LD reference
+  baseline_score_df <- map_score(ref = snp_info, score = baseline_score_df)
+  imputed_score_df  <- map_score(ref = snp_info, score = imputed_score_df)
+  
+  # Make sure SNP order is identical and corresponds to snp.info
+  # (map_score should guarantee this if implemented consistently)
+  stopifnot(identical(baseline_score_df$SNP, snp_info$SNP))
+  stopifnot(identical(imputed_score_df$SNP,  snp_info$SNP))
+  
+  K <- length(beta_cols)
+  
+  # But for simplicity and consistency with eigen-LD, we’ll keep everyone;
+  # zeros simply don't contribute to variance/covariance.
+  # If you want to trim, you'd also need to trim snp_info and block structure consistently.
+  
+  ## ---- Identify blocks with any non-zero baseline or imputed betas ----
+  nz_baseline <- apply(baseline_score_df[, beta_cols, with = FALSE], 1L,
+                       function(x) any(x != 0))
+  nz_imputed  <- apply(imputed_score_df[,  beta_cols, with = FALSE], 1L,
+                       function(x) any(x != 0))
+  nz_any      <- nz_baseline | nz_imputed
+  
+  nz_blocks <- unique(snp_info$Block[nz_any])
+  
+  ## ---- Parallel loop over blocks ----
+  acc <- foreach::foreach(
+    b         = nz_blocks,
+    .packages = "data.table",
+    .export   = c("readEig")
+  ) %dopar% {
+    
+    print(b)
+    
+    idx_b <- which(snp_info$Block == b)
+    if (!length(idx_b)) {
+      return(numeric(0))
+    }
+    
+    # Check if there is any non-zero in this block across baseline or imputed
+    any_nonzero <- FALSE
+    for (k in seq_len(K)) {
+      if (any(baseline_score_df[[beta_cols[k]]][idx_b] != 0, na.rm = TRUE) ||
+          any(imputed_score_df[[beta_cols[k]]][idx_b]  != 0, na.rm = TRUE)) {
+        any_nonzero <- TRUE
+        break
+      }
+    }
+    if (!any_nonzero) {
+      # Zero contribution from this block
+      out <- c(
+        setNames(rep(0, K), paste0("var_base_", beta_cols)),
+        setNames(rep(0, K), paste0("var_imp_",  beta_cols)),
+        setNames(rep(0, K), paste0("cov_",      beta_cols))
+      )
+      return(out)
+    }
+    
+    eig <- readEig(ld_dir, b)
+    
+    # S_b calculated for scaling weights, but NOT for the final variance multiplier
+    S_b <- snp_info$S[idx_b] 
+    
+    # BETA matrices (m_b x K)
+    Bbase_b <- sapply(beta_cols, function(cl) baseline_score_df[[cl]][idx_b])
+    Bimp_b  <- sapply(beta_cols, function(cl) imputed_score_df[[cl]][idx_b])
+    Bbase_b[is.na(Bbase_b)] <- 0
+    Bimp_b[is.na(Bimp_b)]   <- 0
+    
+    # W = S * BETA (Converts to standardized effect sizes)
+    Wbase_b <- S_b * Bbase_b
+    Wimp_b  <- S_b * Bimp_b
+    
+    # Transform into eigen space
+    Ut_Wbase <- crossprod(eig$U, Wbase_b)  # (k_eig x K)
+    Ut_Wimp  <- crossprod(eig$U, Wimp_b)   # (k_eig x K)
+    
+    var_base_b <- colSums((sqrt(eig$lambda) * Ut_Wbase)^2)
+    var_imp_b  <- colSums((sqrt(eig$lambda) * Ut_Wimp )^2)
+    cov_b      <- colSums((eig$lambda) * Ut_Wbase * Ut_Wimp)
+    
+    out <- c(
+      setNames(var_base_b, paste0("var_base_", beta_cols)),
+      setNames(var_imp_b,  paste0("var_imp_",  beta_cols)),
+      setNames(cov_b,      paste0("cov_",      beta_cols))
+    )
+    out
+  }
+  
+  ## ---- Reduce across blocks ----
+  metrics_sum <- Reduce(function(a, b) {
+    if (length(a) == 0) return(b)
+    a[names(b)] <- a[names(b)] + b
+    a
+  }, acc, init = numeric(0))
+  
+  get_vec <- function(prefix) {
+    nm <- paste0(prefix, "_", beta_cols)
+    unname(metrics_sum[nm])
+  }
+  
+  var_base_sum <- get_vec("var_base")
+  var_imp_sum  <- get_vec("var_imp")
+  cov_sum      <- get_vec("cov")
+  
+  ## ---- Final metrics ----
+  rel_var <- ifelse(var_base_sum > 0, var_imp_sum / var_base_sum, NA_real_)
+  rel_R2  <- ifelse(var_base_sum > 0 & var_imp_sum > 0,
+                    (cov_sum^2) / (var_base_sum * var_imp_sum),
+                    NA_real_)
+  
+  data.table(
+    beta_set     = beta_cols,
+    var_baseline = var_base_sum,
+    var_imputed  = var_imp_sum,
+    relative_variance = rel_var,
+    cor2_baseline_imputed = rel_R2
+  )
+}
+
